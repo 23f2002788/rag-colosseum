@@ -118,11 +118,51 @@ def embed_query(text):
     return vec / max(float(np.linalg.norm(vec)), 1e-12)
 
 
-def hybrid_scores(text):
-    """Return (normalized query vector, combined dense+lexical score per passage)."""
+# ---- Entity-aware retrieval ----
+ENTITY_BOOST = 0.10
+ENTITY_PATTERNS = {
+    "mysql": r"mysql|innodb",
+    "postgres": r"postgres(?:ql)?|pgbouncer",
+    "rsa": r"\brsa\b",
+    "ecc": r"\becc\b|elliptic|ecdsa|ed25519|secp256",
+    "oauth": r"oauth|pkce",
+    "raft": r"\braft\b",
+    "paxos": r"paxos",
+    "transformer": r"transformer (?:encoder|decoder)s?|transformer blocks?",
+    "adamw": r"adamw",
+    "sgd": r"\bsgd\b|stochastic gradient",
+    "redis": r"\bredis\b",
+    "memcached": r"memcached",
+    "cassandra": r"cassandra",
+    "mongodb": r"mongodb|wiredtiger",
+    "swim": r"\bswim\b",
+    "quic": r"\bquic\b",
+}
+ENT_RE = {k: re.compile(v, re.I) for k, v in ENTITY_PATTERNS.items()}
+PASSAGE_ENTS = [{k for k, rx in ENT_RE.items() if rx.search(p)} for p in KB]
+
+
+def question_entities(text):
+    return {k for k, rx in ENT_RE.items() if rx.search(text)}
+
+
+def score_parts(text):
+    """Return (query vector, raw score, boosted score). Raw is used for abstaining,
+    boosted is used only for ranking."""
     vec = embed_query(text)
-    combined = np.clip(0.70 * (P_EMB @ vec) + 0.30 * lexical_scores(text), 0.0, 1.0)
-    return vec, combined
+    raw = np.clip(0.70 * (P_EMB @ vec) + 0.30 * lexical_scores(text), 0.0, 1.0)
+    ents = question_entities(text)
+    boost = np.zeros(N_DOCS, dtype=np.float32)
+    if ents:
+        for i, pe in enumerate(PASSAGE_ENTS):
+            boost[i] = ENTITY_BOOST * len(ents & pe) / len(ents)
+    return vec, raw, np.clip(raw + boost, 0.0, 1.0)
+
+
+def hybrid_scores(text):
+    """Return (normalized query vector, ranking score per passage)."""
+    vec, _, boosted = score_parts(text)
+    return vec, boosted
 
 
 def expand(text):
@@ -335,34 +375,33 @@ def health_check():
     return {"status": "ok", "passages": len(KB)}
 
 
-@app.post("/query")
-def query(request: QueryRequest):
-    raw = request.question or ""
-    question = clean_question(raw)
-    print(f"RAW={raw!r}\n  CLEAN={question!r}", flush=True)
+def run_pipeline(question, top_k):
+    """Returns a response dict, or None meaning 'abstain'."""
+    # numbers inside a "Since/Given ...," premise may be false: keep them out of retrieval
+    retrieval_q = re.sub(r"\b\d[\d.,]*\b", " ", question) if premise_split(question) else question
+    q_exp = expand(retrieval_q)
+    q_vector, raw, combined = score_parts(q_exp)
 
-    if len(question.split()) < 2 or unknown_entities(question):
-        print("  -> ABSTAIN (short/unknown entity)", flush=True)
-        return ABSTAIN
+    best_raw = float(raw.max())
+    if best_raw < THRESH:                      # abstention rule unchanged: raw score, no bonus
+        print(f"  -> ABSTAIN (best={best_raw:.3f})", flush=True)
+        return None
 
-    q_exp = expand(question)
-    q_vector, combined = hybrid_scores(q_exp)
-    order = np.argsort(-combined)
-    best_score = float(combined[order[0]])
-    if best_score < THRESH:
-        print(f"  -> ABSTAIN (best={best_score:.3f})", flush=True)
-        return ABSTAIN
-
-    selected, order = pick_passages(question, combined)
+    selected, order = pick_passages(retrieval_q, combined)
 
     if len(selected) > 1:
-        # Synthesis: return the full text of each needed passage so every number is present.
         answer = " ".join(KB[i] for i in selected)
     else:
+        # evidence check 1: the passage must mention the named entity in the question
+        q_ents = question_entities(retrieval_q)
+        if q_ents and not (q_ents & PASSAGE_ENTS[selected[0]]):
+            print("  -> ABSTAIN (entity not supported by best passage)", flush=True)
+            return None
+        # evidence check 2: "How does X ..." words must appear in the passage
         if HOW_Q.match(question) and not covered(question, selected[0]):
             print("  -> ABSTAIN (question words not covered by best passage)", flush=True)
-            return ABSTAIN
-        tail = premise_split(question)  # ignore a (possibly false) premise when choosing the sentence
+            return None
+        tail = premise_split(question)
         if tail:
             sent_text = expand(tail)
             sent_vec = embed_query(sent_text)
@@ -370,11 +409,11 @@ def query(request: QueryRequest):
             sent_text, sent_vec = q_exp, q_vector
         answer = best_sentence(sent_vec, sent_text, selected[0])
 
-    k = max(min(request.top_k, MAX_TOP_K), len(selected))
+    k = max(min(top_k, MAX_TOP_K), len(selected))
     rest = [int(i) for i in order if int(i) not in selected][: k - len(selected)]
     final = sorted(selected, key=lambda i: -float(combined[i])) + rest
 
-    scores, prev = [], 1.0  # keep scores in descending order, as the API contract requires
+    scores, prev = [], 1.0
     for i in final:
         prev = min(float(combined[i]), prev)
         scores.append(round(prev, 4))
@@ -384,5 +423,31 @@ def query(request: QueryRequest):
         "answer": answer,
         "sources": final,
         "scores": scores,
-        "confidence": round(float(np.clip(0.60 + (best_score - THRESH) * 1.2, 0.62, 0.98)), 3),
+        "confidence": round(float(np.clip(0.60 + (best_raw - THRESH) * 1.2, 0.62, 0.98)), 3),
     }
+
+
+@app.post("/query")
+def query(request: QueryRequest):
+    raw = request.question or ""
+    question = clean_question(raw)
+    print(f"RAW={raw!r}\n  CLEAN={question!r}", flush=True)
+
+    if len(question.split()) < 2:
+        print("  -> ABSTAIN (short)", flush=True)
+        return ABSTAIN
+
+    if not unknown_entities(question):
+        return run_pipeline(question, request.top_k) or ABSTAIN
+
+    # unknown name found: a leftover trick sentence may be the cause, so retry per sentence
+    parts = [s.strip() for s in re.split(r"(?<=[.!?])\s+|\n+", question) if s.strip()]
+    if len(parts) > 1:
+        for s in parts:
+            if FACTUAL_START.search(s) and len(s.split()) >= 3 and not unknown_entities(s):
+                print(f"  -> retry on sentence {s!r}", flush=True)
+                result = run_pipeline(s, request.top_k)
+                if result:
+                    return result
+    print("  -> ABSTAIN (unknown entity)", flush=True)
+    return ABSTAIN
