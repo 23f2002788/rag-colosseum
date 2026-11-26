@@ -356,7 +356,7 @@ def pick_passages(question, combined):
 ABSTAIN = {"answer": None, "sources": [], "scores": [], "confidence": 0.1}
 
 # -------------------- API --------------------
-app = FastAPI(title="RAG Colosseum API", version="1.3.0")
+app = FastAPI(title="RAG Colosseum API", version="1.4.0")
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
 
 
