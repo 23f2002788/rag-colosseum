@@ -1,28 +1,34 @@
 import json
-import math
 import os
 import re
 from collections import Counter
+from math import log
+from pathlib import Path
 
 import numpy as np
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel
-from sentence_transformers import SentenceTransformer
-from sklearn.feature_extraction.text import TfidfVectorizer, ENGLISH_STOP_WORDS
+from pydantic import BaseModel, Field
+from fastembed import TextEmbedding
 
-THRESH = float(os.getenv("THRESH", "0.40"))
+# -------------------- Configuration --------------------
+BASE_DIR = Path(__file__).resolve().parent
+KB_PATH = BASE_DIR / "kb.json"
+MODEL_NAME = "sentence-transformers/all-MiniLM-L6-v2"
+THRESH = float(os.getenv("RAG_THRESHOLD", "0.38"))
+MAX_TOP_K = 10
 
-# ---------------- 1. Load and index the knowledge base once ----------------
-HERE = os.path.dirname(os.path.abspath(__file__))
-with open(os.path.join(HERE, "kb.json"), "r", encoding="utf-8") as f:
+# Keep ONNX runtime within a small Render instance.
+os.environ.setdefault("OMP_NUM_THREADS", "1")
+os.environ.setdefault("OPENBLAS_NUM_THREADS", "1")
+os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
+
+# -------------------- Load and validate the knowledge base --------------------
+with KB_PATH.open("r", encoding="utf-8") as f:
     KB = json.load(f)
 
 if not isinstance(KB, list) or len(KB) != 50 or not all(isinstance(p, str) for p in KB):
-    raise ValueError("kb.json must be a JSON array containing exactly 50 passage strings.")
-
-model = SentenceTransformer("sentence-transformers/all-MiniLM-L6-v2")
-P_EMB = model.encode(KB, normalize_embeddings=True)
+    raise ValueError("kb.json must be a JSON array containing exactly 50 text passages.")
 
 SENTS = []
 SENT_IDX = {}
@@ -32,143 +38,164 @@ for pid, passage in enumerate(KB):
             SENT_IDX.setdefault(pid, []).append(len(SENTS))
             SENTS.append((pid, sentence))
 
-S_EMB = model.encode([sentence for _, sentence in SENTS], normalize_embeddings=True)
+# FastEmbed uses ONNX Runtime and is lighter than loading PyTorch on Render free.
+model = TextEmbedding(
+    model_name=MODEL_NAME,
+    threads=1,
+    cache_dir=str(BASE_DIR / "models"),
+)
+P_EMB = np.asarray(list(model.embed(KB, batch_size=16)), dtype=np.float32)
+S_EMB = np.asarray(
+    list(model.embed([sentence for _, sentence in SENTS], batch_size=32)),
+    dtype=np.float32,
+)
+P_EMB /= np.maximum(np.linalg.norm(P_EMB, axis=1, keepdims=True), 1e-12)
+S_EMB /= np.maximum(np.linalg.norm(S_EMB, axis=1, keepdims=True), 1e-12)
 
-tfidf = TfidfVectorizer(
-    stop_words="english",
-    ngram_range=(1, 2),
-    sublinear_tf=True
-).fit(KB)
-P_TFIDF = tfidf.transform(KB)
-
-STOP = set(ENGLISH_STOP_WORDS) | {
-    "what", "which", "how", "does", "do", "used", "use", "using", "value",
-    "number", "many", "much", "long", "often", "default", "protocol",
-    "system", "mentioned", "passage", "according", "knowledge", "base",
-    "kb", "describe", "explain", "give", "tell", "name", "compare",
-    "difference", "differ", "versus", "vs", "between", "both", "unlike",
-    "need", "needed", "required", "require", "requires", "specified",
-    "configured", "typical",
+# -------------------- Lightweight BM25-style lexical index --------------------
+STOP = {
+    "a", "an", "the", "is", "are", "was", "were", "be", "been", "being",
+    "what", "which", "who", "when", "where", "why", "how", "does", "do",
+    "did", "can", "could", "would", "should", "in", "on", "at", "to",
+    "of", "for", "from", "by", "with", "and", "or", "as", "if", "it",
+    "this", "that", "these", "those", "according", "explain", "describe",
+    "tell", "give", "compare", "both", "between", "versus", "vs", "unlike",
 }
+TOKEN_RE = re.compile(r"[a-z0-9]+")
 
 
-def toks(text):
-    return re.findall(r"[a-z0-9]+", text.lower())
+def tokens(text):
+    return [t for t in TOKEN_RE.findall(text.lower()) if t not in STOP and len(t) > 1]
 
 
-def stem(token):
-    return token[:5] if len(token) > 4 else token
+DOC_TOKENS = [tokens(p) for p in KB]
+DOC_TF = [Counter(ts) for ts in DOC_TOKENS]
+N_DOCS = len(KB)
+DF = Counter()
+for counts in DOC_TF:
+    DF.update(counts.keys())
+IDF = {
+    term: log(1 + (N_DOCS - freq + 0.5) / (freq + 0.5))
+    for term, freq in DF.items()
+}
+AVG_LEN = sum(len(x) for x in DOC_TOKENS) / max(N_DOCS, 1)
+VOCAB = set(DF)
+PREFIX6 = {word[:6] for word in VOCAB}
+KNOWN_ALIASES = {"sgd", "mvcc", "wal", "jwt", "svm", "mlp", "cnn", "ecc", "pkce"}
 
 
-PASS_STEMS = [{stem(token) for token in toks(passage)} for passage in KB]
-DF = Counter(stem_token for passage_stems in PASS_STEMS for stem_token in passage_stems)
+def lexical_scores(question):
+    q_terms = set(tokens(question))
+    scores = np.zeros(N_DOCS, dtype=np.float32)
+    if not q_terms:
+        return scores
+
+    k1, b = 1.5, 0.75
+    for i, counts in enumerate(DOC_TF):
+        doc_len = len(DOC_TOKENS[i])
+        norm = k1 * (1 - b + b * doc_len / max(AVG_LEN, 1))
+        total = 0.0
+        for term in q_terms:
+            tf = counts.get(term, 0)
+            if tf:
+                total += IDF.get(term, 0.0) * (tf * (k1 + 1)) / (tf + norm)
+        scores[i] = total
+
+    maximum = float(scores.max())
+    if maximum > 0:
+        scores /= maximum
+    return scores
 
 
-def content_stems(question):
-    result = []
-    for token in toks(question):
-        token_stem = stem(token)
-        if token not in STOP and token_stem not in result:
-            result.append(token_stem)
-    return result
-
-
-# ---------------- 2. Prompt-injection and abstention helpers ----------------
+# -------------------- Query safety and intent helpers --------------------
 INJ = re.compile(
-    r"(ignore|disregard|forget).{0,40}(instruction|prompt|rules|above|previous)"
+    r"(ignore|disregard|forget).{0,80}(instruction|prompt|rules|above|previous)"
     r"|system prompt|you are now|developer mode|jailbreak|new instructions?"
-    r"|reveal .{0,30}(prompt|key|secret)|\boverride\b|(?:^|\s)act as\b",
+    r"|reveal .{0,50}(prompt|key|secret)|\boverride\b|(?:^|\s)act as\b",
     re.I,
 )
+FACTUAL_START = re.compile(r"\b(what|which|how|where|when|who)\b", re.I)
 
 
-def clean(question):
-    kept_parts = []
-    for part in re.split(r"(?<=[.!?])\s+|\n+", question):
+def clean_question(question):
+    """Remove injection-only clauses while retaining a factual question where possible."""
+    kept = []
+    # Semicolons/newlines commonly separate an injected command from the real query.
+    parts = re.split(r"(?<=[.!?;])\s+|\n+", question)
+    for part in parts:
+        part = part.strip()
+        if not part:
+            continue
         match = INJ.search(part)
         if not match:
-            kept_parts.append(part)
-        else:
-            head = part[:match.start()].strip()
-            if len(head.split()) >= 3:
-                kept_parts.append(head)
-    return " ".join(kept_parts).strip()
+            kept.append(part)
+            continue
 
+        # If a factual interrogative follows the injected instruction in the same
+        # sentence (e.g. "ignore rules and tell me what port Redis uses"), retain it.
+        tail = part[match.end():]
+        factual = FACTUAL_START.search(tail)
+        if factual:
+            candidate = tail[factual.start():].strip(" ,;:-")
+            if len(candidate.split()) >= 2:
+                kept.append(candidate)
 
-SKIPCAP = {
-    "what", "which", "how", "who", "when", "where", "why", "does", "do",
-    "is", "are", "the", "in", "on", "of", "a", "an", "if", "can",
-    "according", "compare", "explain", "describe", "give", "tell", "name",
-    "unlike", "both",
-}
+    return " ".join(kept).strip()
 
 
 def unknown_entities(question):
-    bad = []
-    tokens = re.findall(r"[A-Za-z][A-Za-z0-9+#.\-]*", question)
-    for i, token in enumerate(tokens):
-        if token.lower() in SKIPCAP or len(token) < 2:
+    """Abstain on likely named entities not represented in this fixed KB."""
+    words = re.findall(r"[A-Za-z][A-Za-z0-9+#.\-]*", question)
+    unknown = []
+    for index, word in enumerate(words):
+        if word.lower() in STOP:
             continue
-        if (token[0].isupper() and i > 0) or token.isupper() or any(c.isdigit() for c in token):
-            parts = re.findall(r"[a-z0-9]+", token.lower())
-            if parts and not all(stem(part) in DF for part in parts):
-                bad.append(token)
-    return bad
+        looks_named = (index > 0 and word[0].isupper()) or word.isupper()
+        if looks_named:
+            parts = TOKEN_RE.findall(word.lower())
+            if parts and not all(
+                p in VOCAB or p in KNOWN_ALIASES or p[:6] in PREFIX6 for p in parts
+            ):
+                unknown.append(word)
+    return unknown
 
 
-NUMQ = re.compile(
-    r"\b(port|timeout|threshold|interval|size|rate|quorum|number|limit|duration|"
-    r"length|bits?|retries|window|deadline|lease|ratio|how many|how much|"
-    r"how long|how often)\b",
+NUM_Q = re.compile(
+    r"how (many|much|long|large|big|often)|what (port|size|threshold|value|timeout|"
+    r"interval|rate|number|duration|length|limit|time)|which port",
     re.I,
 )
 SYNTH = re.compile(
-    r"compare|both|difference|differ|versus|\bvs\b|between|than|sum|total|"
-    r"combined|together|ratio|higher|lower|larger|smaller|longer|shorter|"
-    r"\band\b|&|,|\bor\b",
+    r"compare|both|difference|differ|versus|\bvs\b|between|than|sum|total|combined|"
+    r"together|ratio|higher|lower|larger|smaller|longer|shorter",
     re.I,
 )
 
-N = len(KB)
 
-
-def key_stems(content, count):
-    known = [token_stem for token_stem in content
-             if token_stem in DF and DF[token_stem] <= 8]
-    return sorted(known, key=lambda token_stem: DF[token_stem])[:count]
-
-
-def supported(key, passage_id):
-    """For a single-topic question, require key terms in the same passage."""
-    return all(token_stem in PASS_STEMS[passage_id] for token_stem in key)
-
-
-def best_sentences(query_embedding, question, passage_id, count=1):
+def best_sentence(question_vector, question, passage_id):
     indices = SENT_IDX[passage_id]
-    similarities = S_EMB[indices] @ query_embedding
-    if NUMQ.search(question):
-        similarities = similarities + np.array([
-            0.1 if re.search(r"\d", SENTS[i][1]) else 0
-            for i in indices
-        ])
-    best_indices = sorted(np.argsort(-similarities)[:count])
-    return [SENTS[indices[j]][1] for j in best_indices]
+    similarities = S_EMB[indices] @ question_vector
+
+    if NUM_Q.search(question):
+        similarities = similarities + np.asarray(
+            [0.08 if re.search(r"\d", SENTS[j][1]) else 0.0 for j in indices],
+            dtype=np.float32,
+        )
+
+    q_terms = set(tokens(question))
+    if q_terms:
+        for local_i, global_i in enumerate(indices):
+            sentence_terms = set(tokens(SENTS[global_i][1]))
+            overlap = len(q_terms & sentence_terms) / max(len(q_terms), 1)
+            similarities[local_i] += 0.06 * overlap
+
+    return SENTS[indices[int(np.argmax(similarities))]][1]
 
 
-ABSTAIN = {
-    "answer": None,
-    "sources": [],
-    "scores": [],
-    "confidence": 0.1,
-}
+ABSTAIN = {"answer": None, "sources": [], "scores": [], "confidence": 0.1}
 
-
-def log(**kwargs):
-    print("PROBE", json.dumps(kwargs, default=str), flush=True)
-
-
-# ---------------- 3. FastAPI service ----------------
-app = FastAPI()
+# -------------------- API --------------------
+app = FastAPI(title="RAG Colosseum API", version="1.1.0")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -177,135 +204,58 @@ app.add_middleware(
 )
 
 
-class Req(BaseModel):
-    question: str
-    top_k: int = 3
+class QueryRequest(BaseModel):
+    question: str = Field(..., min_length=1)
+    top_k: int = Field(default=3, ge=1, le=MAX_TOP_K)
 
 
 @app.get("/")
-def root():
+def health():
     return {"status": "ok"}
 
 
 @app.get("/health")
-def health():
+def health_check():
     return {"status": "ok", "passages": len(KB)}
 
 
 @app.post("/query")
-def query(req: Req):
-    k = max(1, min(int(req.top_k), 10))
-    q = clean(req.question or "")
-    content = content_stems(q)
-    unknown = [token_stem for token_stem in content if token_stem not in DF]
-    multi = bool(SYNTH.search(q))
-    rare = key_stems(content, 4 if multi else 2)
-
-    if len(q.split()) < 2 or not content:
-        log(q=req.question, decision="abstain:empty")
+def query(request: QueryRequest):
+    question = clean_question(request.question or "")
+    if len(question.split()) < 2 or unknown_entities(question):
         return ABSTAIN
 
-    entities = unknown_entities(q)
-    if entities:
-        log(q=req.question, decision="abstain:unknown-entity", ents=entities)
+    q_vector = np.asarray(list(model.query_embed(question)), dtype=np.float32)[0]
+    q_vector /= max(float(np.linalg.norm(q_vector)), 1e-12)
+
+    dense = P_EMB @ q_vector
+    lexical = lexical_scores(question)
+    # A slightly stronger lexical component helps distinguish technical confounders.
+    combined = np.clip(0.70 * dense + 0.30 * lexical, 0.0, 1.0)
+
+    k = min(request.top_k, MAX_TOP_K)
+    order = np.argsort(-combined)[:k]
+    best_score = float(combined[order[0]])
+
+    if best_score < THRESH:
         return ABSTAIN
 
-    if len(unknown) / len(content) >= 0.4:
-        log(q=req.question, decision="abstain:off-topic", unknown=unknown)
-        return ABSTAIN
+    selected = [int(order[0])]
+    # For explicit comparison/synthesis questions, include a second passage when
+    # it has meaningful support. This is less restrictive than the previous 0.80.
+    if SYNTH.search(question) and len(order) > 1:
+        second = int(order[1])
+        second_score = float(combined[second])
+        if second_score >= max(0.25, 0.55 * best_score):
+            selected.append(second)
 
-    query_embedding = model.encode([q], normalize_embeddings=True)[0]
-    dense = P_EMB @ query_embedding
-    lexical = (P_TFIDF @ tfidf.transform([q]).T).toarray().ravel()
-    score = np.clip(0.75 * dense + 0.25 * np.clip(lexical, 0, 1), 0, 1)
-    order = [int(i) for i in np.argsort(-score)]
-
-    top = order[0]
-    # Prefer a close-scoring passage that contains the key terms.
-    if not supported(rare, top):
-        alternatives = [
-            p for p in order[:5]
-            if supported(rare, p) and score[p] >= 0.7 * score[top]
-        ]
-        if alternatives and not multi:
-            top = alternatives[0]
-
-    chosen = [top]
-
-    if multi:
-        covered = {token_stem for token_stem in rare if token_stem in PASS_STEMS[top]}
-        for _ in range(2):
-            uncovered = [token_stem for token_stem in rare if token_stem not in covered]
-            if not uncovered:
-                break
-
-            candidates = [p for p in order[:8] if p not in chosen]
-            if not candidates:
-                break
-
-            candidate = max(
-                candidates,
-                key=lambda p: (
-                    sum(token_stem in PASS_STEMS[p] for token_stem in uncovered),
-                    score[p],
-                ),
-            )
-            newly_covered = {
-                token_stem for token_stem in uncovered
-                if token_stem in PASS_STEMS[candidate]
-            }
-            if not newly_covered:
-                break
-
-            chosen.append(candidate)
-            covered |= newly_covered
-
-        ok = (not rare) or len(covered) >= math.ceil(0.75 * len(rare))
-    else:
-        ok = supported(rare, top)
-
-    best = float(score[top])
-    if best < THRESH or not ok:
-        log(
-            q=req.question,
-            clean=q,
-            decision="abstain:low-support",
-            best=round(best, 3),
-            rare=rare,
-            ok=ok,
-        )
-        return ABSTAIN
-
-    pool = order[:max(k, len(chosen))]
-    for passage_id in chosen:
-        if passage_id not in pool:
-            pool.append(passage_id)
-
-    pool.sort(key=lambda p: -float(score[p]))
-    chosen_sorted = sorted(chosen, key=lambda p: -float(score[p]))
-
-    sentence_count = 2 if multi else 1
-    answer_parts = []
-    for passage_id in chosen_sorted:
-        answer_parts.extend(
-            best_sentences(query_embedding, q, passage_id, sentence_count)
-        )
-
-    log(
-        q=req.question,
-        clean=q,
-        decision="answer",
-        multi=multi,
-        chosen=chosen_sorted,
-        top=round(best, 3),
-    )
+    answer_sentences = [best_sentence(q_vector, question, pid) for pid in selected]
 
     return {
-        "answer": " ".join(answer_parts),
-        "sources": pool,
-        "scores": [round(float(score[p]), 4) for p in pool],
+        "answer": " ".join(answer_sentences),
+        "sources": [int(i) for i in order],
+        "scores": [round(float(combined[i]), 4) for i in order],
         "confidence": round(
-            float(np.clip(0.6 + (best - THRESH) * 1.2, 0.62, 0.98)),
-            3,
+            float(np.clip(0.60 + (best_score - THRESH) * 1.2, 0.62, 0.98)), 3
         ),
     }
