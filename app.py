@@ -397,6 +397,15 @@ def run_pipeline(question, top_k):
         if q_ents and not (q_ents & PASSAGE_ENTS[selected[0]]):
             print("  -> ABSTAIN (entity not supported by best passage)", flush=True)
             return None
+        # evidence check 3: numbers asserted in a "Since/Given ...," premise must exist in the passage
+        tail_q = premise_split(question)
+        if tail_q:
+            premise_text = question.replace(tail_q, " ")
+            asserted = set(re.findall(r"\d+(?:\.\d+)?", premise_text))
+            in_passage = set(re.findall(r"\d+(?:\.\d+)?", KB[selected[0]]))
+            if asserted - in_passage:
+                print(f"  -> ABSTAIN (false premise: {sorted(asserted - in_passage)} not in passage)", flush=True)
+                return None
         # evidence check 2: "How does X ..." words must appear in the passage
         if HOW_Q.match(question) and not covered(question, selected[0]):
             print("  -> ABSTAIN (question words not covered by best passage)", flush=True)
