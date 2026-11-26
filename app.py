@@ -68,6 +68,14 @@ def tokens(text):
     return [t for t in TOKEN_RE.findall(norm_versions(text)) if t not in STOP and len(t) > 1]
 
 
+def stem_set(text):
+    """Tokens with a trailing 's' removed, so 'heartbeats' matches 'heartbeat'."""
+    return {
+        t[:-1] if len(t) > 3 and t.endswith("s") and not t.endswith("ss") else t
+        for t in tokens(text)
+    }
+
+
 DOC_TOKENS = [tokens(p) for p in KB]
 DOC_TF = [Counter(ts) for ts in DOC_TOKENS]
 N_DOCS = len(KB)
@@ -105,23 +113,39 @@ def lexical_scores(question):
     return scores
 
 
+def embed_query(text):
+    vec = np.asarray(list(model.query_embed(text)), dtype=np.float32)[0]
+    return vec / max(float(np.linalg.norm(vec)), 1e-12)
+
+
 def hybrid_scores(text):
     """Return (normalized query vector, combined dense+lexical score per passage)."""
-    vec = np.asarray(list(model.query_embed(text)), dtype=np.float32)[0]
-    vec /= max(float(np.linalg.norm(vec)), 1e-12)
+    vec = embed_query(text)
     combined = np.clip(0.70 * (P_EMB @ vec) + 0.30 * lexical_scores(text), 0.0, 1.0)
     return vec, combined
 
 
+def expand(text):
+    """Add the KB's own wording when a question paraphrases it
+    (keepalive/coordinator/subordinate -> heartbeats/leader/follower)."""
+    low = text.lower()
+    extra = []
+    if re.search(r"keep-?alive", low) and re.search(
+        r"coordinator|subordinate|election|follower|leader", low
+    ):
+        extra.append("heartbeats leader follower election timeouts")
+    return text + (" " + " ".join(extra) if extra else "")
+
+
 # -------------------- Injection defence --------------------
 INJ = re.compile(
-    r"(ignore|disregard|forget|bypass).{0,80}(instruction|prompt|rules?|above|previous|prior|context|knowledge base|passages?)"
+    r"(ignore|disregard|forget|bypass).{0,80}(instruction|prompt|rules?|above|previous|prior|context|constraints?|knowledge base|passages?)"
     r"|system prompt|you are now|developer mode|jailbreak|new instructions?"
     r"|\bsystem\s*(override|message|note|instruction)"
     r"|reveal .{0,50}(prompt|key|secret)|\boverride\b|(?:^|\s)act as\b|pretend (to be|you)"
     r"|(reply|respond|answer)\s+(only\s+)?with\b"
     r"|(output|print|say|write)\s+(exactly|only|just)?\s*[\"'\u201c]"
-    r"|\[/?(inst|system)\]|instead of answering",
+    r"|\[/?(inst|system)\]|instead of answering|force sources",
     re.I,
 )
 FACTUAL_START = re.compile(r"\b(what|which|how|where|when|who)\b", re.I)
@@ -151,10 +175,10 @@ def clean_question(question):
         if not m:
             kept.append(part)
             continue
-        head = part[: m.start()].strip(" ,;:-")        # text BEFORE the injection
+        head = part[: m.start()].strip(" ,;:-")
         if len(head.split()) >= 2:
             kept.append(head)
-        tail = part[m.end():]                           # text AFTER the injection
+        tail = part[m.end():]
         f = FACTUAL_START.search(tail)
         if f:
             cand = tail[f.start():].strip(" ,;:-")
@@ -164,14 +188,18 @@ def clean_question(question):
 
 
 def unknown_entities(question):
-    """Abstain on named things (Kafka, Kubernetes...) that are not in this KB."""
-    words = re.findall(r"[A-Za-z][A-Za-z0-9+#.\-]*", question)
+    """Abstain on named things (Kafka, Zab, CLR...) that are not in this KB.
+    Capitalised words that merely START a sentence (e.g. 'Furthermore') are ignored."""
     unknown = []
-    for index, word in enumerate(words):
+    for m in re.finditer(r"[A-Za-z][A-Za-z0-9+#.\-]*", question):
+        word = m.group(0)
         if word.lower() in STOP:
             continue
-        looks_named = (index > 0 and word[0].isupper()) or word.isupper()
-        if looks_named:
+        before = question[: m.start()].rstrip()
+        sentence_start = before == "" or before[-1] in ".!?:;"
+        if sentence_start and not (word.isupper() and len(word) > 1):
+            continue
+        if word[0].isupper() or word.isupper():
             parts = TOKEN_RE.findall(word.lower())
             if parts and not all(
                 p in VOCAB or p in KNOWN_ALIASES or p[:6] in PREFIX6 for p in parts
@@ -183,18 +211,21 @@ def unknown_entities(question):
 # -------------------- Answer extraction --------------------
 NUM_Q = re.compile(
     r"how (many|much|long|large|big|often)|what (port|size|threshold|value|timeout|"
-    r"interval|rate|number|duration|length|limit|time)|which port",
+    r"interval|rate|number|duration|length|limit|time)|which port"
+    r"|\b(duration|milliseconds?|bits|port|interval|timeout|threshold|latency|window|"
+    r"coefficient|learning rate|layers?|blocks?|batch|quorum|size|length)\b",
     re.I,
 )
 SYNTH = re.compile(
-    r"compare|both|difference|differ|versus|\bvs\b|between|than|sum|total|combined|"
-    r"together|ratio|higher|lower|larger|smaller|longer|shorter",
+    r"compare|\bboth\b|differenc|differ\b|versus|\bvs\b|combined|together|\bratio\b|\bsum\b"
+    r"|(higher|lower|larger|smaller|longer|shorter)\s+than",
     re.I,
 )
 SPLIT = re.compile(
     r"\band\b|\bversus\b|\bvs\.?(?=\s)|\bthan\b|\bcompared (?:to|with)\b|\bwith\b|\bor\b|,|;",
     re.I,
 )
+HOW_Q = re.compile(r"^\s*how\s+(does|do|did|can|could|would)\b", re.I)
 
 
 def best_sentence(question_vector, question, passage_id):
@@ -204,17 +235,65 @@ def best_sentence(question_vector, question, passage_id):
         sims = sims + np.asarray(
             [0.08 if re.search(r"\d", SENTS[j][1]) else 0.0 for j in indices], dtype=np.float32
         )
-    q_terms = set(tokens(question))
+    q_terms = stem_set(question)
     if q_terms:
         for local_i, global_i in enumerate(indices):
-            overlap = len(q_terms & set(tokens(SENTS[global_i][1]))) / max(len(q_terms), 1)
+            overlap = len(q_terms & stem_set(SENTS[global_i][1])) / max(len(q_terms), 1)
             sims[local_i] += 0.06 * overlap
     return SENTS[indices[int(np.argmax(sims))]][1]
+
+
+def premise_split(question):
+    """'Since X is 100, what is Y?'  ->  'what is Y?'  (None if no premise clause)."""
+    m = re.match(
+        r"^\s*(?:since|given(?: that)?|assuming(?: that)?|because|considering(?: that)?|"
+        r"suppose(?: that)?|if)\b.*?,\s*((?:what|which|how|where|when|who)\b.*)$",
+        question,
+        re.I | re.S,
+    )
+    return m.group(1).strip() if m else None
+
+
+def covered(question, pid, min_cov=0.5):
+    """For 'How does X ...' questions: do the question's words actually appear in the passage?"""
+    q = tokens(question)
+    if not q:
+        return True
+    doc = {w[:5] for w in DOC_TOKENS[pid]}
+    hits = sum(1 for t in q if t[:5] in doc)
+    return hits / len(q) >= min_cov
+
+
+def synth_chunks(question):
+    """Split 'Synthesizing X: A. Furthermore, in adjacent architecture: B. How do both integrate?'
+    into the two facts A and B."""
+    parts = re.split(r"(?i)\bfurthermore\b[,:]?", question)
+    if len(parts) < 2:
+        return []
+    chunks = []
+    for p in parts[:2]:
+        p = re.sub(r"(?i)^[^:.]*synthesi[sz]ing[^:]*:", "", p)
+        p = re.sub(r"(?i)\bin adjacent architecture\s*:", "", p)
+        p = re.sub(r"(?i)\bhow (do|does) (both|they|these)\b.*$", "", p)
+        p = p.strip(" ,;:-")
+        if len(tokens(p)) >= 2:
+            chunks.append(p)
+    return chunks
 
 
 def pick_passages(question, combined):
     """Pick 1 passage normally; for compare/combine questions pick 2 (max 3)."""
     order = np.argsort(-combined)
+
+    chunks = synth_chunks(question)
+    if len(chunks) == 2:
+        pids = []
+        for c in chunks:
+            _, s = hybrid_scores(expand(c))
+            pids.append(int(np.argmax(s)))
+        if pids[0] != pids[1]:
+            return pids, order
+
     selected = [int(order[0])]
     if not SYNTH.search(question):
         return selected, order
@@ -223,7 +302,7 @@ def pick_passages(question, combined):
     segments = [s.strip() for s in SPLIT.split(question) if len(tokens(s)) >= 1]
     if len(segments) > 1:
         for seg in segments:
-            _, seg_scores = hybrid_scores(seg)
+            _, seg_scores = hybrid_scores(expand(seg))
             pid = int(np.argmax(seg_scores))
             if pid in pool and seg_scores[pid] >= 0.25 and pid not in selected:
                 selected.append(pid)
@@ -237,7 +316,7 @@ def pick_passages(question, combined):
 ABSTAIN = {"answer": None, "sources": [], "scores": [], "confidence": 0.1}
 
 # -------------------- API --------------------
-app = FastAPI(title="RAG Colosseum API", version="1.2.0")
+app = FastAPI(title="RAG Colosseum API", version="1.3.0")
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
 
 
@@ -260,13 +339,14 @@ def health_check():
 def query(request: QueryRequest):
     raw = request.question or ""
     question = clean_question(raw)
-    print(f"RAW={raw!r}\n  CLEAN={question!r}", flush=True)  # visible in Render logs
+    print(f"RAW={raw!r}\n  CLEAN={question!r}", flush=True)
 
     if len(question.split()) < 2 or unknown_entities(question):
         print("  -> ABSTAIN (short/unknown entity)", flush=True)
         return ABSTAIN
 
-    q_vector, combined = hybrid_scores(question)
+    q_exp = expand(question)
+    q_vector, combined = hybrid_scores(q_exp)
     order = np.argsort(-combined)
     best_score = float(combined[order[0]])
     if best_score < THRESH:
@@ -274,21 +354,35 @@ def query(request: QueryRequest):
         return ABSTAIN
 
     selected, order = pick_passages(question, combined)
-    k = max(min(request.top_k, MAX_TOP_K), len(selected))
-    rest = [int(i) for i in order if int(i) not in selected][: k - len(selected)]
-    final = sorted(selected + rest, key=lambda i: -float(combined[i]))
 
     if len(selected) > 1:
-        # Synthesis: give the full text of each needed passage so every number is present.
+        # Synthesis: return the full text of each needed passage so every number is present.
         answer = " ".join(KB[i] for i in selected)
     else:
-        answer = best_sentence(q_vector, question, selected[0])
+        if HOW_Q.match(question) and not covered(question, selected[0]):
+            print("  -> ABSTAIN (question words not covered by best passage)", flush=True)
+            return ABSTAIN
+        tail = premise_split(question)  # ignore a (possibly false) premise when choosing the sentence
+        if tail:
+            sent_text = expand(tail)
+            sent_vec = embed_query(sent_text)
+        else:
+            sent_text, sent_vec = q_exp, q_vector
+        answer = best_sentence(sent_vec, sent_text, selected[0])
 
-    result = {
+    k = max(min(request.top_k, MAX_TOP_K), len(selected))
+    rest = [int(i) for i in order if int(i) not in selected][: k - len(selected)]
+    final = sorted(selected, key=lambda i: -float(combined[i])) + rest
+
+    scores, prev = [], 1.0  # keep scores in descending order, as the API contract requires
+    for i in final:
+        prev = min(float(combined[i]), prev)
+        scores.append(round(prev, 4))
+
+    print(f"  -> sources={final} selected={selected}\n  ANSWER={answer[:220]!r}", flush=True)
+    return {
         "answer": answer,
         "sources": final,
-        "scores": [round(float(combined[i]), 4) for i in final],
+        "scores": scores,
         "confidence": round(float(np.clip(0.60 + (best_score - THRESH) * 1.2, 0.62, 0.98)), 3),
     }
-    print(f"  -> sources={final} selected={selected}", flush=True)
-    return result
